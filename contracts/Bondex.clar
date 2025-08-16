@@ -753,3 +753,369 @@
     (ok true)
   )
 )
+
+(define-constant ERR_ALREADY_RATED (err u300))
+(define-constant ERR_BOND_NOT_MATURED (err u301))
+(define-constant ERR_NOT_BONDHOLDER (err u302))
+(define-constant ERR_INVALID_RATING (err u303))
+(define-constant ERR_ISSUER_NOT_FOUND (err u304))
+(define-constant ERR_INSUFFICIENT_RATING_HISTORY (err u305))
+(define-constant ERR_CANNOT_RATE_OWN_BOND (err u306))
+
+(define-data-var rating-threshold uint u3)
+(define-data-var default-threshold uint u7200)
+(define-data-var risk-adjustment-factor uint u100)
+
+(define-map issuer-ratings
+  { issuer: principal }
+  {
+    total-ratings: uint,
+    total-score: uint,
+    average-rating: uint,
+    bonds-defaulted: uint,
+    bonds-completed: uint,
+    last-updated: uint,
+    risk-score: uint,
+    default-probability: uint
+  }
+)
+
+(define-map bond-ratings
+  { bond-id: uint, rater: principal }
+  {
+    rating: uint,
+    payment-timeliness: uint,
+    communication-quality: uint,
+    covenant-compliance: uint,
+    overall-satisfaction: uint,
+    rated-at: uint
+  }
+)
+
+(define-map issuer-performance-history
+  { issuer: principal, bond-id: uint }
+  {
+    issued-amount: uint,
+    redemption-amount: uint,
+    matured-on-time: bool,
+    late-payment-blocks: uint,
+    covenant-violations: uint,
+    final-status: (string-ascii 20)
+  }
+)
+
+(define-map rating-eligibility
+  { bond-id: uint, holder: principal }
+  { eligible: bool, held-amount: uint, held-duration: uint }
+)
+
+(define-map risk-categories
+  { risk-level: uint }
+  {
+    min-score: uint,
+    max-score: uint,
+    fee-multiplier: uint,
+    category-name: (string-ascii 20)
+  }
+)
+
+(define-public (submit-bond-rating (bond-id uint) (rating uint) (payment-timeliness uint) (communication-quality uint) (covenant-compliance uint) (overall-satisfaction uint))
+  (let
+    (
+      (bond-data (unwrap! (map-get? bonds { bond-id: bond-id }) ERR_BOND_NOT_FOUND))
+      (issuer (get issuer bond-data))
+      (holder-balance (get-bond-balance bond-id tx-sender))
+      (existing-rating (map-get? bond-ratings { bond-id: bond-id, rater: tx-sender }))
+    )
+    (asserts! (>= stacks-block-height (get maturity-block bond-data)) ERR_BOND_NOT_MATURED)
+    (asserts! (> holder-balance u0) ERR_NOT_BONDHOLDER)
+    (asserts! (not (is-eq tx-sender issuer)) ERR_CANNOT_RATE_OWN_BOND)
+    (asserts! (is-none existing-rating) ERR_ALREADY_RATED)
+    (asserts! (and (>= rating u1) (<= rating u10)) ERR_INVALID_RATING)
+    (asserts! (and (>= payment-timeliness u1) (<= payment-timeliness u10)) ERR_INVALID_RATING)
+    (asserts! (and (>= communication-quality u1) (<= communication-quality u10)) ERR_INVALID_RATING)
+    (asserts! (and (>= covenant-compliance u1) (<= covenant-compliance u10)) ERR_INVALID_RATING)
+    (asserts! (and (>= overall-satisfaction u1) (<= overall-satisfaction u10)) ERR_INVALID_RATING)
+    
+    (map-set bond-ratings
+      { bond-id: bond-id, rater: tx-sender }
+      {
+        rating: rating,
+        payment-timeliness: payment-timeliness,
+        communication-quality: communication-quality,
+        covenant-compliance: covenant-compliance,
+        overall-satisfaction: overall-satisfaction,
+        rated-at: stacks-block-height
+      }
+    )
+    
+    (map-set rating-eligibility
+      { bond-id: bond-id, holder: tx-sender }
+      {
+        eligible: false,
+        held-amount: holder-balance,
+        held-duration: (- stacks-block-height (get issue-block bond-data))
+      }
+    )
+    
+    (let ((ignore-result (update-issuer-rating issuer)))
+      (ok true)
+    )
+  )
+)
+
+(define-public (record-bond-performance (bond-id uint) (redemption-amount uint) (matured-on-time bool) (late-payment-blocks uint) (covenant-violations uint) (final-status (string-ascii 20)))
+  (let
+    (
+      (bond-data (unwrap! (map-get? bonds { bond-id: bond-id }) ERR_BOND_NOT_FOUND))
+      (issuer (get issuer bond-data))
+      (issued-amount (* (get face-value bond-data) (get total-supply bond-data)))
+    )
+    (asserts! (or (is-eq tx-sender issuer) (is-eq tx-sender CONTRACT_OWNER)) ERR_UNAUTHORIZED)
+    
+    (map-set issuer-performance-history
+      { issuer: issuer, bond-id: bond-id }
+      {
+        issued-amount: issued-amount,
+        redemption-amount: redemption-amount,
+        matured-on-time: matured-on-time,
+        late-payment-blocks: late-payment-blocks,
+        covenant-violations: covenant-violations,
+        final-status: final-status
+      }
+    )
+    
+    (let ((ignore-result (update-issuer-rating issuer)))
+      (ok true)
+    )
+  )
+)
+
+(define-public (calculate-risk-adjusted-fee (issuer principal) (base-fee uint))
+  (let
+    (
+      (issuer-rating-data (get-issuer-rating-data issuer))
+      (risk-score (get risk-score issuer-rating-data))
+      (risk-category (get-risk-category-by-score risk-score))
+      (fee-multiplier (get fee-multiplier risk-category))
+    )
+    (ok (/ (* base-fee fee-multiplier) u100))
+  )
+)
+
+(define-public (initialize-risk-categories)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    
+    (map-set risk-categories { risk-level: u1 } { min-score: u90, max-score: u100, fee-multiplier: u80, category-name: "AAA" })
+    (map-set risk-categories { risk-level: u2 } { min-score: u80, max-score: u89, fee-multiplier: u90, category-name: "AA" })
+    (map-set risk-categories { risk-level: u3 } { min-score: u70, max-score: u79, fee-multiplier: u100, category-name: "A" })
+    (map-set risk-categories { risk-level: u4 } { min-score: u60, max-score: u69, fee-multiplier: u120, category-name: "BBB" })
+    (map-set risk-categories { risk-level: u5 } { min-score: u50, max-score: u59, fee-multiplier: u150, category-name: "BB" })
+    (map-set risk-categories { risk-level: u6 } { min-score: u40, max-score: u49, fee-multiplier: u200, category-name: "B" })
+    (map-set risk-categories { risk-level: u7 } { min-score: u30, max-score: u39, fee-multiplier: u250, category-name: "CCC" })
+    (map-set risk-categories { risk-level: u8 } { min-score: u0, max-score: u29, fee-multiplier: u300, category-name: "D" })
+    
+    (ok true)
+  )
+)
+
+(define-public (update-issuer-default-status (issuer principal) (defaulted bool))
+  (let
+    (
+      (current-rating (get-issuer-rating-data issuer))
+      (current-defaults (get bonds-defaulted current-rating))
+      (current-completed (get bonds-completed current-rating))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    
+    (map-set issuer-ratings
+      { issuer: issuer }
+      (merge current-rating {
+        bonds-defaulted: (if defaulted (+ current-defaults u1) current-defaults),
+        bonds-completed: (+ current-completed u1),
+        last-updated: stacks-block-height
+      })
+    )
+    
+    (let ((ignore-result (update-issuer-rating issuer)))
+      (ok true)
+    )
+  )
+)
+
+(define-public (set-rating-parameters (new-threshold uint) (new-default-threshold uint) (new-risk-factor uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (> new-threshold u0) ERR_INVALID_PARAMETERS)
+    (asserts! (> new-default-threshold u0) ERR_INVALID_PARAMETERS)
+    (asserts! (> new-risk-factor u0) ERR_INVALID_PARAMETERS)
+    
+    (var-set rating-threshold new-threshold)
+    (var-set default-threshold new-default-threshold)
+    (var-set risk-adjustment-factor new-risk-factor)
+    (ok true)
+  )
+)
+
+(define-private (update-issuer-rating (issuer principal))
+  (let
+    (
+      (current-rating (default-to 
+        { total-ratings: u0, total-score: u0, average-rating: u0, bonds-defaulted: u0, bonds-completed: u0, last-updated: u0, risk-score: u50, default-probability: u10 }
+        (map-get? issuer-ratings { issuer: issuer })
+      ))
+      (new-rating-data (calculate-issuer-metrics issuer current-rating))
+    )
+    (map-set issuer-ratings
+      { issuer: issuer }
+      new-rating-data
+    )
+    (ok true)
+  )
+)
+
+(define-private (calculate-issuer-metrics (issuer principal) (current-data {total-ratings: uint, total-score: uint, average-rating: uint, bonds-defaulted: uint, bonds-completed: uint, last-updated: uint, risk-score: uint, default-probability: uint}))
+  (let
+    (
+      (rating-count u0)
+      (rating-sum u0)
+      (new-average u50)
+      (default-rate (calculate-default-rate issuer))
+      (risk-score (calculate-risk-score new-average default-rate))
+      (default-probability (calculate-default-probability risk-score))
+    )
+    {
+      total-ratings: rating-count,
+      total-score: rating-sum,
+      average-rating: new-average,
+      bonds-defaulted: (get bonds-defaulted current-data),
+      bonds-completed: (get bonds-completed current-data),
+      last-updated: stacks-block-height,
+      risk-score: risk-score,
+      default-probability: default-probability
+    }
+  )
+)
+
+(define-private (calculate-default-rate (issuer principal))
+  (let
+    (
+      (rating-data (get-issuer-rating-data issuer))
+      (total-bonds (+ (get bonds-defaulted rating-data) (get bonds-completed rating-data)))
+      (defaulted-bonds (get bonds-defaulted rating-data))
+    )
+    (if (> total-bonds u0)
+      (/ (* defaulted-bonds u100) total-bonds)
+      u0
+    )
+  )
+)
+
+(define-private (calculate-risk-score (average-rating uint) (default-rate uint))
+  (let
+    (
+      (rating-component (* average-rating u10))
+      (default-penalty (* default-rate u5))
+      (base-score (if (>= rating-component default-penalty) (- rating-component default-penalty) u0))
+    )
+    (if (> base-score u100) u100 base-score)
+  )
+)
+
+(define-private (calculate-default-probability (risk-score uint))
+  (if (>= risk-score u80)
+    u2
+    (if (>= risk-score u60)
+      u5
+      (if (>= risk-score u40)
+        u15
+        u30
+      )
+    )
+  )
+)
+
+
+
+(define-private (get-bond-rating-count (bond-id uint))
+  u0
+)
+
+(define-private (get-bond-rating-sum (bond-id uint))
+  u0
+)
+
+(define-read-only (get-issuer-rating-data (issuer principal))
+  (default-to 
+    { total-ratings: u0, total-score: u0, average-rating: u50, bonds-defaulted: u0, bonds-completed: u0, last-updated: u0, risk-score: u50, default-probability: u10 }
+    (map-get? issuer-ratings { issuer: issuer })
+  )
+)
+
+(define-read-only (get-bond-rating (bond-id uint) (rater principal))
+  (map-get? bond-ratings { bond-id: bond-id, rater: rater })
+)
+
+(define-read-only (get-issuer-performance (issuer principal) (bond-id uint))
+  (map-get? issuer-performance-history { issuer: issuer, bond-id: bond-id })
+)
+
+(define-read-only (get-risk-category-by-score (risk-score uint))
+  (if (>= risk-score u90)
+    (unwrap-panic (map-get? risk-categories { risk-level: u1 }))
+    (if (>= risk-score u80)
+      (unwrap-panic (map-get? risk-categories { risk-level: u2 }))
+      (if (>= risk-score u70)
+        (unwrap-panic (map-get? risk-categories { risk-level: u3 }))
+        (if (>= risk-score u60)
+          (unwrap-panic (map-get? risk-categories { risk-level: u4 }))
+          (if (>= risk-score u50)
+            (unwrap-panic (map-get? risk-categories { risk-level: u5 }))
+            (if (>= risk-score u40)
+              (unwrap-panic (map-get? risk-categories { risk-level: u6 }))
+              (if (>= risk-score u30)
+                (unwrap-panic (map-get? risk-categories { risk-level: u7 }))
+                (unwrap-panic (map-get? risk-categories { risk-level: u8 }))
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)
+
+(define-read-only (get-rating-eligibility (bond-id uint) (holder principal))
+  (map-get? rating-eligibility { bond-id: bond-id, holder: holder })
+)
+
+(define-read-only (get-issuer-risk-assessment (issuer principal))
+  (let
+    (
+      (rating-data (get-issuer-rating-data issuer))
+      (risk-category (get-risk-category-by-score (get risk-score rating-data)))
+    )
+    {
+      issuer: issuer,
+      average-rating: (get average-rating rating-data),
+      risk-score: (get risk-score rating-data),
+      default-probability: (get default-probability rating-data),
+      risk-category: (get category-name risk-category),
+      fee-multiplier: (get fee-multiplier risk-category),
+      total-ratings: (get total-ratings rating-data),
+      bonds-completed: (get bonds-completed rating-data),
+      bonds-defaulted: (get bonds-defaulted rating-data)
+    }
+  )
+)
+
+(define-read-only (get-rating-thresholds)
+  {
+    rating-threshold: (var-get rating-threshold),
+    default-threshold: (var-get default-threshold),
+    risk-adjustment-factor: (var-get risk-adjustment-factor)
+  }
+)
+
+
