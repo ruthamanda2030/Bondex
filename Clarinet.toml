@@ -9,6 +9,10 @@ requirements = []
 path = 'contracts/Bondex.clar'
 clarity_version = 3
 epoch = 3.1
+[contracts.bond-rating-system]
+path = 'contracts/bond-rating-system.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
